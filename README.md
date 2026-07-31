@@ -1,79 +1,94 @@
 # Transformer Poking
 
-`transformer.py` is a small decoder-only Transformer written with Python lists.
-It has one layer and one attention head. It is designed to be changed, not to
-be fast or useful as a language model.
+This repository is a small, inspectable decoder-only Transformer. It is for
+learning and controlled experiments, not for useful language generation or
+production scale.
 
-There is no finite list of *all* Transformer extensions. The first part of this
-document is a map of the major architecture extensions used in research and
-systems through 2026. The appendix separates concerns that are important for a
-working model but are not Transformer architecture.
+## Current model
 
-## Baseline in this directory
-
-The toy model contains:
+`transformer.py` is the readable reference implementation. It has:
 
 1. Token embeddings.
 2. Learned positional embeddings.
 3. One causal self-attention head.
-4. One residual path.
-5. Layer normalization.
-6. A two-layer ReLU feed-forward network.
-7. Tied input and output embeddings.
-8. Greedy next-token generation.
+4. Residual connections and layer normalization.
+5. A two-layer ReLU feed-forward network.
+6. Greedy next-token prediction.
 
-It has random weights and no training code. Its output is useful for inspecting
-shapes and changing equations.
+The reference model loads `transformer.json`, which contains a six-token toy
+checkpoint. It also understands an optional `output_embedding` field for
+checkpoints with separate input and output embeddings.
 
-# Extending to 3090
+## Current training experiment
 
-The GA102 whitepaper lists tensor core acceleration for:
+The active learning path is pure Python. It does not require PyTorch:
 
-- TF32, BF16, FP16, INT8, and INT4 Tensor Core acceleration
-- Also "binary 1-bit operations"
-- Avoid FP64
-    - FP64 double precision CUDA executes at 1/64 of FP32 rate; no FP64 tensor core mode
-- TF32 tensors can be supplied, cuBLAS may execute with FP32 8-bit range + 10-bit mantissa, FP32 accumulation/output
+```bash
+python train_binary_manual.py --epochs 100
+```
 
-## Official RTX 3090 peak figures
+The trainer loads the reference checkpoint, then creates a binary training
+model with:
 
-For the RTX 3090 Founders Edition, NVIDIA list:
+- Two token classes: `0` and `1`.
+- Separate input and output embeddings.
+- One Transformer block.
+- Learned positional embeddings.
+- Full-batch gradient descent.
+- Human-readable JSON output.
 
-FP32 CUDA cores: 35.6 TFLOPS
-TF32 Tensor: 35.6 dense / 71 sparse TFLOPS
-BF16 Tensor with FP32 accumulate: 71 dense / 142 sparse TFLOPS
-FP16 Tensor with FP32 accumulate: 71 dense / 142 sparse TFLOPS
-FP16 Tensor with FP16 accumulate: 142 dense / 284 sparse TFLOPS
-INT8 Tensor: 284 dense / 568 sparse TOPS
-INT4 Tensor: 568 dense / 1,136 sparse TOPS
+The model learns the alternating rule:
 
-## Dtype policy for PyTorch training
+```text
+0 1 0 1 ...  ->  1 0 1 0 ...
+1 0 1 0 ...  ->  0 1 0 1 ...
+```
 
-Use PyTorch with AMP and choose **BF16 mixed precision** as the baseline. This
-uses the RTX 3090's BF16 Tensor Cores, has FP32-like exponent range, and avoids
-the loss-scaling problems that FP16 can require. This is a dtype decision only;
-it does not require changing the JSON representation of the toy model.
+The implementation is intentionally scalar and slow. It exists so that the
+forward pass, gradients, updates, and checkpoint values remain visible.
 
-| Data | Dtype | Reason |
-| --- | --- | --- |
-| Token IDs and labels | `torch.int64` | Native `Embedding` and cross-entropy index type |
-| Parameters and parameter gradients | `torch.float32` | Stable master weights and updates |
-| AdamW state | `torch.float32` | Stable optimizer moments |
-| Linear/attention activations | `torch.bfloat16` under `torch.autocast` | Fast Tensor Core math |
-| LayerNorm, softmax, attention reductions, logits, and loss | `torch.float32` | Prevent overflow and loss of small values |
+## Tests and diagnostics
 
-The JSON numbers are Python floating-point values after loading. When a future
-PyTorch loader reads them, create parameters as `float32`; autocast should make
-eligible operations use BF16 without permanently converting the master
-parameters. Keep token IDs as integer tensors and never cast them to BF16.
+Run the unit tests:
 
-Do not use FP64 for model data. Do not use INT8 or INT4 during training; reserve
-those for later inference quantization. FP16 is a valid speed benchmark on the
-3090, but use it only as an explicit alternative with `GradScaler`. BF16 is the
-preferred default for a small training loop because it is simpler and more
-robust. If a run uses full FP32 instead, enable Ampere TF32 matmul in PyTorch;
-TF32 is a matmul compute mode, not a stored parameter dtype.
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
 
+Run the real training integration test:
+
+```bash
+python test/integration/test_binary_training.py
+```
+
+Run all focused diagnostics for a sequence length of 15:
+
+```bash
+tests/diagnostic/test.sh 15
+```
+
+Individual diagnostics are in `tests/diagnostic/`:
+
+- `data.py`: dataset baseline and full-model causality.
+- `gradients.py`: graph size, gradient statistics, and finite differences.
+- `updates.py`: update direction and parameter movement.
+- `inference.py`: probabilities, predictions, and class histograms.
+- `training.py`: one-position, sequence-overfit, and both-phase training.
+
+The diagnostic sequence length is a training length. A held-out length is not
+used during training and is evaluated later to test generalization beyond the
+training positions.
+
+## Checkpoint formats
+
+The normal learning checkpoint is JSON because it is easy to inspect. Trained
+binary checkpoints include `output_embedding` and have vocabulary size 2.
+`transformer.py` can load these checkpoints.
+
+Safetensors and PyTorch conversion utilities remain deferred until the
+transparent training path has more experiments. When that work starts, use
+FP32 master parameters and accelerator-appropriate mixed precision rather than
+changing the educational model first.
 
 # Transformer extensions
 
@@ -323,14 +338,17 @@ models belong in the appendix's adjacent-model category, not in the core list.
 
 ## Suggested order for modifying this toy
 
-1. Add a second block and print the shape after every operation.
-2. Replace one head with two heads.
-3. Add a real padding/mask argument.
-4. Replace learned positions with sinusoidal positions or RoPE.
-5. Replace ReLU with GELU or a gated MLP.
-6. Add key/value caching to `generate`.
-7. Add a configurable temperature and sampling method.
-8. Add a small training loop only after the forward pass is clear.
+1. Train binary sequences at lengths 5, 15, and 31.
+2. Evaluate a held-out sequence length without updating the weights.
+3. Add an inference command that prints probabilities and predictions.
+4. Compare plain gradient descent with momentum and AdamW.
+5. Add a second block and inspect its intermediate values.
+6. Replace one head with two heads.
+7. Add a real padding/mask argument.
+8. Replace learned positions with sinusoidal positions or RoPE.
+9. Replace ReLU with GELU or a gated MLP.
+10. Add key/value caching to `generate`.
+11. Add configurable temperature and sampling.
 
 # Appendix: non-Transformer concerns
 
@@ -360,7 +378,10 @@ Transformer architecture.
 - Distributed training and fault recovery.
 - Random seeds and experiment configuration.
 
-The current file has none of these. Its weights are initialized randomly.
+The repository now contains a small autodiff engine, gradient descent,
+cross-entropy training, JSON checkpointing, and integration diagnostics. More
+advanced optimizers, schedules, mixed precision, and distributed training are
+future exercises.
 
 ## Generation and decoding
 
